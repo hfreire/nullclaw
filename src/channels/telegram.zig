@@ -18,7 +18,7 @@ const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 16 * 1024;
 const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 500;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
-const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 64;
+const DRAFT_FLUSH_MIN_DELTA_BYTES: usize = 16;
 const DRAFT_FLUSH_MIN_INTERVAL_MS: i64 = 200;
 const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"commands":[
@@ -2576,7 +2576,7 @@ pub const TelegramChannel = struct {
 
     fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8) void {
         if (builtin.is_test) return;
-        if (text.len == 0) return;
+        if (text.len == 0 or std.mem.trimLeft(u8, text, " \t\n\r").len == 0) return;
 
         var url_buf: [512]u8 = undefined;
         const url = self.apiUrl(&url_buf, "sendMessageDraft") catch return;
