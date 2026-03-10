@@ -469,7 +469,7 @@ fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
 }
 
-pub fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
+fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("\n## Tool Use Protocol\n\n");
     try w.writeAll("To use a tool, you MUST wrap a JSON object in <tool_call></tool_call> or [TOOL_CALL][/TOOL_CALL] tags.\n");
     try w.writeAll("The JSON object MUST contain exactly two fields: \"name\" (string) and \"arguments\" (object).\n\n");
@@ -824,6 +824,28 @@ test "pathStartsWith handles root prefixes" {
     try std.testing.expect(!pathStartsWith("/tmpx/workspace", "/tmp"));
 }
 
+test "buildToolInstructions includes protocol and tool metadata" {
+    const allocator = std.testing.allocator;
+    const MockTool = struct {
+        fn name(_: @This()) []const u8 {
+            return "mock";
+        }
+        fn description(_: @This()) []const u8 {
+            return "A mock tool";
+        }
+        fn parametersJson(_: @This()) []const u8 {
+            return "{\"value\":\"string\"}";
+        }
+    };
+    const tools = [_]MockTool{.{}};
+    const instructions = try buildToolInstructions(allocator, &tools);
+    defer allocator.free(instructions);
+
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "## Tool Use Protocol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "**mock**: A mock tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, instructions, "Parameters: `{\"value\":\"string\"}`") != null);
+}
+
 test "buildSystemPrompt includes core sections" {
     const allocator = std.testing.allocator;
     const prompt = try buildSystemPrompt(allocator, .{
@@ -840,6 +862,37 @@ test "buildSystemPrompt includes core sections" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Runtime") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "test-model") != null);
+}
+
+test "buildSystemPrompt emits a single tool listing section" {
+    const allocator = std.testing.allocator;
+    const MockPromptTool = struct {
+        const Self = @This();
+        pub const tool_name = "mock";
+        pub const tool_description = "A mock tool";
+        pub const tool_params = "{}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return tools_mod.ToolResult.ok("");
+        }
+    };
+    var mock_tool = MockPromptTool{};
+    const tools = [_]Tool{mock_tool.tool()};
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &tools,
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prompt, "## Tool Use Protocol"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, prompt, "**mock**: A mock tool"));
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "## Tools") == null);
 }
 
 test "buildSystemPrompt includes workspace dir" {
