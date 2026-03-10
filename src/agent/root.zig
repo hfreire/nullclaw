@@ -247,6 +247,7 @@ pub const Agent = struct {
     model_routes: []const config_types.ModelRouteConfig = &.{},
     model_pinned_by_user: bool = false,
     last_route_trace: ?[]u8 = null,
+    degraded_routes: std.ArrayListUnmanaged(DegradedRoute) = .empty,
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
@@ -478,6 +479,10 @@ pub const Agent = struct {
             self.allocator.free(model);
         }
         self.detected_vision_disabled.deinit(self.allocator);
+        for (self.degraded_routes.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
     }
 
@@ -808,6 +813,55 @@ pub const Agent = struct {
         return null;
     }
 
+    fn degradedRouteMatches(entry: *const DegradedRoute, route: config_types.ModelRouteConfig) bool {
+        return std.mem.eql(u8, entry.hint, route.hint) and
+            std.mem.eql(u8, entry.provider, route.provider) and
+            std.mem.eql(u8, entry.model, route.model);
+    }
+
+    fn pruneExpiredDegradedRoutes(self: *Agent, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.degraded_routes.items.len) {
+            if (self.degraded_routes.items[i].until_ms <= now_ms) {
+                var expired = self.degraded_routes.orderedRemove(i);
+                expired.deinit(self.allocator);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn findActiveDegradedRoute(self: *Agent, route: config_types.ModelRouteConfig, now_ms: i64) ?*DegradedRoute {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
+    fn hasDegradedRouteHint(self: *const Agent, hint: []const u8, now_ms: i64) bool {
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            for (self.degraded_routes.items) |entry| {
+                if (entry.until_ms > now_ms and degradedRouteMatches(&entry, route)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn findUsableModelRouteByHint(self: *Agent, hint: []const u8, now_ms: i64) ?config_types.ModelRouteConfig {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            if (self.findActiveDegradedRoute(route, now_ms) == null) return route;
+        }
+        return null;
+    }
+
+    fn hasUsableModelRouteHint(self: *Agent, hint: []const u8, now_ms: i64) bool {
+        return self.findUsableModelRouteByHint(hint, now_ms) != null;
+    }
+
     const RouteSelection = struct {
         hint: []const u8,
         route: config_types.ModelRouteConfig,
@@ -816,19 +870,82 @@ pub const Agent = struct {
         score: ?i32 = null,
     };
 
+    const DegradedRoute = struct {
+        hint: []const u8,
+        provider: []const u8,
+        model: []const u8,
+        reason: []u8,
+        until_ms: i64,
+
+        fn deinit(self: *DegradedRoute, allocator: std.mem.Allocator) void {
+            allocator.free(self.reason);
+        }
+    };
+
+    const auto_route_degrade_cooldown_ms: i64 = 5 * 60 * 1000;
+
     fn routeSelectionForHint(
-        self: *const Agent,
+        self: *Agent,
         hint: []const u8,
         reason: []const u8,
         matched_keyword: ?[]const u8,
+        now_ms: i64,
     ) ?RouteSelection {
-        const route = self.findModelRouteByHint(hint) orelse return null;
+        const route = self.findUsableModelRouteByHint(hint, now_ms) orelse return null;
         return .{
             .hint = hint,
             .route = route,
             .reason = reason,
             .matched_keyword = matched_keyword,
         };
+    }
+
+    fn apiErrorSuggestsQuotaExhaustion(self: *Agent) bool {
+        const detail = providers.snapshotLastApiErrorDetail(self.allocator) catch return false;
+        defer if (detail) |owned| self.allocator.free(owned);
+        const snapshot = detail orelse return false;
+        return providers.reliable.isRateLimited(snapshot) or
+            containsAsciiIgnoreCase(snapshot, "quota") or
+            containsAsciiIgnoreCase(snapshot, "credit") or
+            containsAsciiIgnoreCase(snapshot, "billing") or
+            containsAsciiIgnoreCase(snapshot, "insufficient_quota") or
+            containsAsciiIgnoreCase(snapshot, "out of credits");
+    }
+
+    fn routeShouldBeDegraded(self: *Agent, err: anyerror) bool {
+        if (err == error.RateLimited) return true;
+        const err_name = @errorName(err);
+        if (providers.reliable.isRateLimited(err_name)) return true;
+        return self.apiErrorSuggestsQuotaExhaustion();
+    }
+
+    fn routeDegradeReason(self: *Agent, err: anyerror) ![]u8 {
+        if (try providers.snapshotLastApiErrorDetail(self.allocator)) |detail| {
+            return detail;
+        }
+        return try self.allocator.dupe(u8, @errorName(err));
+    }
+
+    fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
+        if (!self.routeShouldBeDegraded(err)) return;
+        const now_ms = std.time.milliTimestamp();
+        const reason = try self.routeDegradeReason(err);
+        errdefer self.allocator.free(reason);
+
+        if (self.findActiveDegradedRoute(selection.route, now_ms)) |entry| {
+            entry.deinit(self.allocator);
+            entry.reason = reason;
+            entry.until_ms = now_ms + auto_route_degrade_cooldown_ms;
+            return;
+        }
+
+        try self.degraded_routes.append(self.allocator, .{
+            .hint = selection.route.hint,
+            .provider = selection.route.provider,
+            .model = selection.route.model,
+            .reason = reason,
+            .until_ms = now_ms + auto_route_degrade_cooldown_ms,
+        });
     }
 
     pub fn clearLastRouteTrace(self: *Agent) void {
@@ -877,19 +994,21 @@ pub const Agent = struct {
         }
     }
 
-    fn selectRouteHintForTurn(self: *const Agent, user_message: []const u8) ?[]const u8 {
+    fn selectRouteHintForTurn(self: *Agent, user_message: []const u8) ?[]const u8 {
         const selection = self.routeSelectionForTurn(user_message) orelse return null;
         return selection.hint;
     }
 
-    fn routeSelectionForTurn(self: *const Agent, user_message: []const u8) ?RouteSelection {
+    fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
         if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
+        const now_ms = std.time.milliTimestamp();
 
-        if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasModelRouteHint("vision")) {
+        if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
             return self.routeSelectionForHint(
                 "vision",
                 "image input with configured vision route",
                 null,
+                now_ms,
             );
         }
 
@@ -911,28 +1030,30 @@ pub const Agent = struct {
         };
         inline for (deep_keywords) |keyword| {
             if (containsAsciiIgnoreCase(user_message, keyword)) {
-                if (self.hasModelRouteHint("deep")) {
-                    return self.routeSelectionForHint("deep", "matched deep-task keyword", keyword);
+                if (self.hasUsableModelRouteHint("deep", now_ms)) {
+                    return self.routeSelectionForHint("deep", "matched deep-task keyword", keyword, now_ms);
                 }
-                if (self.hasModelRouteHint("reasoning")) {
-                    return self.routeSelectionForHint("reasoning", "matched deep-task keyword", keyword);
+                if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
+                    return self.routeSelectionForHint("reasoning", "matched deep-task keyword", keyword, now_ms);
                 }
             }
         }
 
         if (user_message.len > 600 or self.history.items.len >= 24) {
-            if (self.hasModelRouteHint("deep")) {
+            if (self.hasUsableModelRouteHint("deep", now_ms)) {
                 return self.routeSelectionForHint(
                     "deep",
                     "long prompt or deep conversation context",
                     null,
+                    now_ms,
                 );
             }
-            if (self.hasModelRouteHint("reasoning")) {
+            if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
                 return self.routeSelectionForHint(
                     "reasoning",
                     "long prompt or deep conversation context",
                     null,
+                    now_ms,
                 );
             }
         }
@@ -965,34 +1086,35 @@ pub const Agent = struct {
         };
         if (user_message.len <= 120) {
             inline for (fast_keywords) |keyword| {
-                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasModelRouteHint("fast")) {
-                    return self.routeSelectionForHint("fast", "matched fast-task keyword", keyword);
+                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasUsableModelRouteHint("fast", now_ms)) {
+                    return self.routeSelectionForHint("fast", "matched fast-task keyword", keyword, now_ms);
                 }
             }
         }
         if (user_message.len <= 220) {
             inline for (structured_fast_keywords) |keyword| {
-                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasModelRouteHint("fast")) {
+                if (containsAsciiIgnoreCase(user_message, keyword) and self.hasUsableModelRouteHint("fast", now_ms)) {
                     return self.routeSelectionForHint(
                         "fast",
                         "matched structured fast-task keyword",
                         keyword,
+                        now_ms,
                     );
                 }
             }
         }
 
-        if (self.hasModelRouteHint("balanced")) {
-            return self.routeSelectionForHint("balanced", "default balanced route", null);
+        if (self.hasUsableModelRouteHint("balanced", now_ms)) {
+            return self.routeSelectionForHint("balanced", "default balanced route", null, now_ms);
         }
-        if (self.hasModelRouteHint("fast")) {
-            return self.routeSelectionForHint("fast", "fallback fast route", null);
+        if (self.hasUsableModelRouteHint("fast", now_ms)) {
+            return self.routeSelectionForHint("fast", "fallback fast route", null, now_ms);
         }
-        if (self.hasModelRouteHint("deep")) {
-            return self.routeSelectionForHint("deep", "fallback deep route", null);
+        if (self.hasUsableModelRouteHint("deep", now_ms)) {
+            return self.routeSelectionForHint("deep", "fallback deep route", null, now_ms);
         }
-        if (self.hasModelRouteHint("reasoning")) {
-            return self.routeSelectionForHint("reasoning", "fallback reasoning route", null);
+        if (self.hasUsableModelRouteHint("reasoning", now_ms)) {
+            return self.routeSelectionForHint("reasoning", "fallback reasoning route", null, now_ms);
         }
         return null;
     }
@@ -1116,6 +1238,22 @@ pub const Agent = struct {
             }
         }
 
+        const now_ms = std.time.milliTimestamp();
+        var wrote_degraded_routes = false;
+        for (self.degraded_routes.items) |entry| {
+            if (entry.until_ms <= now_ms) continue;
+            if (!wrote_degraded_routes) {
+                try w.writeAll("\nDegraded routes:");
+                wrote_degraded_routes = true;
+            }
+            const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+            const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+            try w.print(
+                "\n  - {s} -> {s}/{s} ({s}; {d}s cooldown remaining)",
+                .{ entry.hint, entry.provider, entry.model, entry.reason, remaining_secs },
+            );
+        }
+
         try w.writeAll("\nSwitch: /model <name>");
         return try out.toOwnedSlice(self.allocator);
     }
@@ -1228,8 +1366,12 @@ pub const Agent = struct {
             break :blk turn_input.llm_user_message orelse user_message;
         };
 
-        const turn_model_name = if (try self.routeModelNameForTurn(self.allocator, effective_user_message)) |routed|
-            routed
+        const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
+        if (turn_route_selection) |selection| {
+            try self.setLastRouteTrace(selection);
+        }
+        const turn_model_name = if (turn_route_selection) |selection|
+            try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model })
         else
             self.model_name;
         const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
@@ -1464,11 +1606,13 @@ pub const Agent = struct {
                             self.stream_callback.?,
                             self.stream_ctx.?,
                         ) catch |retry_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
                     }
 
+                    if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
                     self.emitUsageFailure(turn_model_name);
                     return err;
                 };
@@ -1534,6 +1678,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
                         };
@@ -1569,6 +1714,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_after_compact_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
                         };
@@ -1619,10 +1765,12 @@ pub const Agent = struct {
                                 turn_model_name,
                                 self.temperature,
                             ) catch |retry_after_compact_err| {
+                                if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                                 self.emitUsageFailure(turn_model_name);
                                 return retry_after_compact_err;
                             };
                         }
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                         self.emitUsageFailure(turn_model_name);
                         return retry_err;
                     };
@@ -4093,6 +4241,51 @@ test "model status reports last auto-route trace" {
 
     try std.testing.expect(std.mem.indexOf(u8, status, "Auto-routing: configured") != null);
     try std.testing.expect(std.mem.indexOf(u8, status, "Last auto-route: fast -> groq/llama-3.3-8b") != null);
+}
+
+test "auto route skips degraded fast route after rate limit" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.RateLimited);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+
+    const status = try agent.formatModelStatus();
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Degraded routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "fast -> groq/llama-3.3-8b") != null);
+}
+
+test "auto route degrades route on out-of-credits provider detail" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+    providers.setLastApiErrorDetail("groq", "out of credits");
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.AllProvidersFailed);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
 }
 
 test "auto route is disabled when model is pinned" {
