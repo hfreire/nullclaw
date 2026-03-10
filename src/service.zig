@@ -260,7 +260,7 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
 fn resolveMacosServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
     if (preferredMacosHomebrewShim(exe_path)) |candidate| {
         std.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => return allocator.dupe(u8, exe_path),
             else => return err,
         };
         return allocator.dupe(u8, candidate);
@@ -269,10 +269,10 @@ fn resolveMacosServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []c
 }
 
 fn preferredMacosHomebrewShim(exe_path: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, exe_path, "/opt/homebrew/Cellar/nullclaw/") != null) {
+    if (std.mem.startsWith(u8, exe_path, "/opt/homebrew/Cellar/nullclaw/")) {
         return "/opt/homebrew/bin/nullclaw";
     }
-    if (std.mem.indexOf(u8, exe_path, "/usr/local/Cellar/nullclaw/") != null) {
+    if (std.mem.startsWith(u8, exe_path, "/usr/local/Cellar/nullclaw/")) {
         return "/usr/local/bin/nullclaw";
     }
     return null;
@@ -597,6 +597,10 @@ test "preferredMacosHomebrewShim resolves Intel Homebrew Cellar install" {
 
 test "preferredMacosHomebrewShim ignores non-Cellar paths" {
     try std.testing.expect(preferredMacosHomebrewShim("/Applications/nullclaw/bin/nullclaw") == null);
+}
+
+test "preferredMacosHomebrewShim ignores substring matches outside canonical prefix" {
+    try std.testing.expect(preferredMacosHomebrewShim("/tmp/opt/homebrew/Cellar/nullclaw/2026.3.7/bin/nullclaw") == null);
 }
 
 test "runChecked succeeds for true command" {
