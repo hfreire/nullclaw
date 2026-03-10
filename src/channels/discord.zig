@@ -213,6 +213,11 @@ pub const DiscordChannel = struct {
 
     fn isReplyToBot(d_obj: std.json.ObjectMap, bot_user_id: []const u8) bool {
         if (bot_user_id.len == 0) return false;
+        const message_type = d_obj.get("type") orelse return false;
+        switch (message_type) {
+            .integer => |value| if (value != 19) return false,
+            else => return false,
+        }
         const referenced_message = d_obj.get("referenced_message") orelse return false;
         const referenced_obj = switch (referenced_message) {
             .object => |o| o,
@@ -1271,7 +1276,7 @@ test "discord handleMessageCreate require_mention accepts reply to bot message" 
     defer alloc.free(ch.bot_user_id.?);
 
     const msg_json =
-        \\{"d":{"channel_id":"c-2","guild_id":"g-2","content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"bot-1","bot":true}}}}
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":19,"content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"bot-1","bot":true}}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
@@ -1298,7 +1303,31 @@ test "discord handleMessageCreate require_mention still blocks reply to non-bot 
     defer alloc.free(ch.bot_user_id.?);
 
     const msg_json =
-        \\{"d":{"channel_id":"c-2","guild_id":"g-2","content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"other-user","bot":false}}}}
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":19,"content":"reply text","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"other-user","bot":false}}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleMessageCreate(parsed.value);
+    try std.testing.expectEqual(@as(usize, 0), event_bus.inboundDepth());
+}
+
+test "discord handleMessageCreate require_mention ignores non-reply references to bot message" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+        .require_mention = true,
+    });
+    ch.setBus(&event_bus);
+    ch.bot_user_id = try alloc.dupe(u8, "bot-1");
+    defer alloc.free(ch.bot_user_id.?);
+
+    const msg_json =
+        \\{"d":{"channel_id":"c-2","guild_id":"g-2","type":21,"content":"","author":{"id":"u-2","bot":false},"referenced_message":{"author":{"id":"bot-1","bot":true}}}}
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, msg_json, .{});
     defer parsed.deinit();
