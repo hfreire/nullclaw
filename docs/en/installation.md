@@ -7,7 +7,7 @@ This guide covers the main installation paths for macOS, Linux, and Windows.
 **Who this page is for**
 
 - First-time users installing NullClaw on a local machine
-- Operators choosing between package install and source build
+- Operators choosing between package install, container deployment, and source build
 - Contributors validating the baseline runtime before deeper setup
 
 **Read this next**
@@ -44,7 +44,82 @@ nullclaw --help
 
 If the command works, installation is complete.
 
-## Option 2: Build from Source (cross-platform)
+## Option 2: Official Container Image (Docker / Podman)
+
+NullClaw publishes an official OCI image at `ghcr.io/nullclaw/nullclaw`.
+
+The container stores its persistent state under `/nullclaw-data`:
+
+- config: `/nullclaw-data/.nullclaw/config.json`
+- workspace: `/nullclaw-data/workspace`
+
+### Quick one-off commands
+
+```bash
+docker run --rm -it \
+  -v nullclaw-data:/nullclaw-data \
+  ghcr.io/nullclaw/nullclaw:latest status
+```
+
+Initialize config interactively:
+
+```bash
+docker run --rm -it \
+  -v nullclaw-data:/nullclaw-data \
+  ghcr.io/nullclaw/nullclaw:latest onboard --interactive
+```
+
+Run the interactive agent:
+
+```bash
+docker run --rm -it \
+  -v nullclaw-data:/nullclaw-data \
+  ghcr.io/nullclaw/nullclaw:latest agent
+```
+
+Run the HTTP gateway:
+
+```bash
+docker run --rm -it \
+  -p 3000:3000 \
+  -v nullclaw-data:/nullclaw-data \
+  ghcr.io/nullclaw/nullclaw:latest
+```
+
+### Docker Compose
+
+The repository ships a `docker-compose.yml` that uses the official image by default.
+
+Interactive onboarding:
+
+```bash
+docker compose --profile agent run --rm agent onboard --interactive
+```
+
+Interactive agent session:
+
+```bash
+docker compose --profile agent run --rm agent
+```
+
+Long-running gateway:
+
+```bash
+docker compose --profile gateway up -d gateway
+```
+
+Profile behavior:
+
+- `agent`: one-off interactive CLI container
+- `gateway`: long-running HTTP gateway on port `3000`
+
+To pin a release tag or switch registries later, override `NULLCLAW_IMAGE`:
+
+```bash
+NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gateway up -d gateway
+```
+
+## Option 3: Build from Source (cross-platform)
 
 ```bash
 git clone https://github.com/nullclaw/nullclaw.git
@@ -57,9 +132,9 @@ Build output:
 
 - `zig-out/bin/nullclaw`
 
-## Option 3: Android / Termux
+## Option 4: Android / Termux
 
-There are three different paths:
+There are three different Android / Termux paths:
 
 - download an official pre-built Android / Termux binary from releases
 - build directly inside Termux on the Android device
