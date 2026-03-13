@@ -275,6 +275,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
     }
+    if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
+        self.system_prompt_conversation_context_fingerprint = null;
+    }
     if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
         if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
         self.system_prompt_model_name = null;

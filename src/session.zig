@@ -486,7 +486,7 @@ pub const SessionManager = struct {
             session.agent.clearInterruptRequest();
         }
 
-        // Set conversation context for this turn (Signal-specific for now)
+        // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 

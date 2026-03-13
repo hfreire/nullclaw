@@ -334,7 +334,7 @@ pub const Agent = struct {
     tool_state_mu: std.Thread.Mutex = .{},
     active_tool_name: ?[]u8 = null,
     interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
-    /// Conversation context for the current turn (Signal-specific for now).
+    /// Conversation context for the current turn.
     conversation_context: ?prompt.ConversationContext = null,
 
     /// Conversation history — owned, growable list.
@@ -347,6 +347,8 @@ pub const Agent = struct {
     has_system_prompt: bool = false,
     /// Whether the currently injected system prompt contains conversation context.
     system_prompt_has_conversation_context: bool = false,
+    /// Fingerprint of the conversation context used for the cached system prompt.
+    system_prompt_conversation_context_fingerprint: ?u64 = null,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
     /// Model name used when building the currently cached system prompt.
@@ -1551,8 +1553,13 @@ pub const Agent = struct {
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
+        const turn_conversation_context_fingerprint = if (self.conversation_context) |ctx|
+            ctx.senderFingerprint()
+        else
+            null;
         const conversation_context_changed = self.has_system_prompt and
-            self.system_prompt_has_conversation_context != turn_has_conversation_context;
+            (self.system_prompt_has_conversation_context != turn_has_conversation_context or
+                self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
             var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
@@ -1611,6 +1618,7 @@ pub const Agent = struct {
             }
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
+            self.system_prompt_conversation_context_fingerprint = turn_conversation_context_fingerprint;
             self.workspace_prompt_fingerprint = workspace_fp;
             if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
             self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
@@ -2791,6 +2799,7 @@ pub const Agent = struct {
         self.history.items.len = 0;
         self.has_system_prompt = false;
         self.system_prompt_has_conversation_context = false;
+        self.system_prompt_conversation_context_fingerprint = null;
         self.workspace_prompt_fingerprint = null;
     }
 
@@ -5693,6 +5702,98 @@ test "turn refreshes system prompt after USER.md change" {
     const second = try agent.turn("second");
     defer allocator.free(second);
     try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "USER-V2-UPDATED") != null);
+}
+
+test "turn refreshes system prompt when conversation sender changes" {
+    const ReloadProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "reload-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var provider_state: u8 = 0;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ReloadProvider.chatWithSystem,
+        .chat = ReloadProvider.chat,
+        .supportsNativeTools = ReloadProvider.supportsNativeTools,
+        .getName = ReloadProvider.getName,
+        .deinit = ReloadProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = workspace,
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    agent.conversation_context = .{
+        .channel = "discord",
+        .sender_id = "user-1",
+        .sender_username = "alpha",
+        .sender_display_name = "Alpha",
+        .group_id = "guild-1",
+        .is_group = true,
+    };
+    const first = try agent.turn("first");
+    defer allocator.free(first);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender username: alpha") != null);
+
+    agent.conversation_context = .{
+        .channel = "discord",
+        .sender_id = "user-2",
+        .sender_username = "beta",
+        .sender_display_name = "Beta",
+        .group_id = "guild-1",
+        .is_group = true,
+    };
+    const second = try agent.turn("second");
+    defer allocator.free(second);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender username: beta") != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[0].content, "Sender Discord ID: user-1") == null);
 }
 
 test "exec security deny blocks shell tool execution" {
