@@ -63,6 +63,7 @@ pub const shell = @import("shell.zig");
 pub const file_read = @import("file_read.zig");
 pub const file_write = @import("file_write.zig");
 pub const file_edit = @import("file_edit.zig");
+pub const file_delete = @import("file_delete.zig");
 pub const file_read_hashed = @import("file_read_hashed.zig");
 pub const file_edit_hashed = @import("file_edit_hashed.zig");
 pub const http_request = @import("http_request.zig");
@@ -351,6 +352,15 @@ pub fn allTools(
     };
     try list.append(allocator, et2.tool());
 
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
+
     const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
     frh.* = .{
         .workspace_dir = workspace_dir,
@@ -604,6 +614,15 @@ pub fn subagentTools(
     };
     try list.append(allocator, et.tool());
 
+    const dt = try allocator.create(file_delete.FileDeleteTool);
+    dt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
+    try list.append(allocator, dt.tool());
+
     const frh = try allocator.create(file_read_hashed.FileReadHashedTool);
     frh.* = .{
         .workspace_dir = workspace_dir,
@@ -783,21 +802,21 @@ test "all tools includes extras when enabled" {
     });
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_read_hashed, file_edit_hashed, git, image_info,
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        delegate, schedule, spawn, pushover, http_request, web_search,
-    //        web_fetch, browser = 20
-    try std.testing.expectEqual(@as(usize, 20), tools.len);
+    //        web_fetch, browser = 21
+    try std.testing.expectEqual(@as(usize, 21), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
     defer deinitTools(std.testing.allocator, tools);
 
-    // Order: shell, file_read, file_write, file_edit, file_read_hashed, file_edit_hashed, git, image_info,
+    // Order: shell, file_read, file_write, file_edit, file_delete, file_read_hashed, file_edit_hashed, git, image_info,
     //        memory_store, memory_recall, memory_list, memory_forget,
-    //        delegate, schedule, spawn = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    //        delegate, schedule, spawn = 16
+    try std.testing.expectEqual(@as(usize, 16), tools.len);
 }
 
 test "all tools wires http and web_search config into tool instances" {
