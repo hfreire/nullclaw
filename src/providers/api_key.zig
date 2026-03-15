@@ -54,12 +54,12 @@ pub fn resolveApiKey(
 
     // 2. Qwen OAuth env/file resolution for the qwen-portal provider only.
     if (std.ascii.eqlIgnoreCase(provider_name, "qwen-portal")) {
-        if (loadNonEmptyEnv(allocator, "QWEN_OAUTH_TOKEN")) |value| {
+        if (try loadNonEmptyEnv(allocator, "QWEN_OAUTH_TOKEN")) |value| {
             return value;
         }
         if (tryLoadQwenCliToken(allocator)) |creds| {
+            defer creds.deinit(allocator);
             const access_token = try allocator.dupe(u8, creds.access_token);
-            creds.deinit(allocator);
             return access_token;
         }
     }
@@ -68,7 +68,7 @@ pub fn resolveApiKey(
     const env_candidates = providerEnvCandidates(provider_name);
     for (env_candidates) |env_var| {
         if (env_var.len == 0) break;
-        if (loadNonEmptyEnv(allocator, env_var)) |value| {
+        if (try loadNonEmptyEnv(allocator, env_var)) |value| {
             return value;
         }
     }
@@ -76,7 +76,7 @@ pub fn resolveApiKey(
     // 4. Generic fallbacks
     const fallbacks = [_][]const u8{ "NULLCLAW_API_KEY", "API_KEY" };
     for (fallbacks) |env_var| {
-        if (loadNonEmptyEnv(allocator, env_var)) |value| {
+        if (try loadNonEmptyEnv(allocator, env_var)) |value| {
             return value;
         }
     }
@@ -84,23 +84,22 @@ pub fn resolveApiKey(
     return null;
 }
 
-fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
-    if (std.process.getEnvVarOwned(allocator, name)) |value| {
-        defer allocator.free(value);
-        const trimmed = std.mem.trim(u8, value, " \t\r\n");
-        if (trimmed.len > 0) {
-            return allocator.dupe(u8, trimmed) catch null;
-        }
-        return null;
-    } else |_| {
-        return null;
-    }
-}
+fn loadNonEmptyEnv(allocator: std.mem.Allocator, name: []const u8) !?[]u8 {
+    const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return null,
+        else => return err,
+    };
+    defer allocator.free(value);
 
-fn dupeTrimmedString(allocator: std.mem.Allocator, value: []const u8) ?[]const u8 {
     const trimmed = std.mem.trim(u8, value, " \t\r\n");
     if (trimmed.len == 0) return null;
-    return allocator.dupe(u8, trimmed) catch null;
+    return try allocator.dupe(u8, trimmed);
+}
+
+fn dupeTrimmedString(allocator: std.mem.Allocator, value: []const u8) !?[]const u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return try allocator.dupe(u8, trimmed);
 }
 
 fn parseEpochMilliseconds(value: std.json.Value) ?i64 {
@@ -135,40 +134,42 @@ pub fn parseQwenCredentialsJson(allocator: std.mem.Allocator, json_bytes: []cons
 
     const access_token_val = root_obj.get("access_token") orelse return null;
     const access_token = switch (access_token_val) {
-        .string => |value| dupeTrimmedString(allocator, value) orelse return null,
+        .string => |value| (dupeTrimmedString(allocator, value) catch return null) orelse return null,
         else => return null,
     };
-    errdefer allocator.free(access_token);
+    var cleanup = true;
+    defer if (cleanup) allocator.free(access_token);
 
     const refresh_token: ?[]const u8 = if (root_obj.get("refresh_token")) |refresh_token_val| switch (refresh_token_val) {
-        .string => |value| dupeTrimmedString(allocator, value),
+        .string => |value| dupeTrimmedString(allocator, value) catch return null,
         else => null,
     } else null;
-    errdefer if (refresh_token) |value| allocator.free(value);
+    defer if (cleanup) if (refresh_token) |value| allocator.free(value);
 
     const token_type: []const u8 = if (root_obj.get("token_type")) |token_type_val| switch (token_type_val) {
-        .string => |value| dupeTrimmedString(allocator, value) orelse (allocator.dupe(u8, "Bearer") catch return null),
+        .string => |value| (dupeTrimmedString(allocator, value) catch return null) orelse (allocator.dupe(u8, "Bearer") catch return null),
         else => return null,
     } else allocator.dupe(u8, "Bearer") catch return null;
-    errdefer allocator.free(token_type);
+    defer if (cleanup) allocator.free(token_type);
 
     const resource_url: ?[]const u8 = if (root_obj.get("resource_url")) |resource_url_val| switch (resource_url_val) {
-        .string => |value| dupeTrimmedString(allocator, value),
+        .string => |value| dupeTrimmedString(allocator, value) catch return null,
         else => null,
     } else null;
-    errdefer if (resource_url) |value| allocator.free(value);
+    defer if (cleanup) if (resource_url) |value| allocator.free(value);
 
     const id_token: ?[]const u8 = if (root_obj.get("id_token")) |id_token_val| switch (id_token_val) {
-        .string => |value| dupeTrimmedString(allocator, value),
+        .string => |value| dupeTrimmedString(allocator, value) catch return null,
         else => null,
     } else null;
-    errdefer if (id_token) |value| allocator.free(value);
+    defer if (cleanup) if (id_token) |value| allocator.free(value);
 
     const expiry_date_ms: ?i64 = if (root_obj.get("expiry_date")) |expiry_date_val|
         parseEpochMilliseconds(expiry_date_val)
     else
         null;
 
+    cleanup = false;
     return .{
         .access_token = access_token,
         .refresh_token = refresh_token,
@@ -494,6 +495,12 @@ test "parseQwenCredentialsJson rejects empty access token" {
 
 test "parseQwenCredentialsJson rejects invalid json" {
     try std.testing.expect(parseQwenCredentialsJson(std.testing.allocator, "{") == null);
+}
+
+test "parseQwenCredentialsJson cleans up on invalid token type" {
+    try std.testing.expect(
+        parseQwenCredentialsJson(std.testing.allocator, "{\"access_token\":\"test-token\",\"token_type\":123}") == null,
+    );
 }
 
 test "tryLoadQwenCliToken disabled during tests" {
