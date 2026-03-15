@@ -10,6 +10,7 @@ const AtomicBool = std.atomic.Value(bool);
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
 const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
@@ -183,7 +184,7 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -300,7 +301,7 @@ pub fn curlPostWithStatus(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -660,6 +661,10 @@ test "curlGetWithResolve compiles and is callable" {
 
 test "curlGetMaxBytes compiles and is callable" {
     _ = curlGetMaxBytes;
+}
+
+test "curl post max bytes is increased for large provider responses" {
+    try std.testing.expect(DEFAULT_CURL_POST_MAX_BYTES >= 8 * 1024 * 1024);
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {
