@@ -26,6 +26,7 @@ const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 
@@ -543,6 +544,9 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("thread_id")) |v| {
             if (v == .string and v.string.len > 0) parsed.fields.thread_id = v.string;
         }
+        if (pm.value.object.get("typing_recipient")) |v| {
+            if (v == .string and v.string.len > 0) parsed.fields.typing_recipient = v.string;
+        }
         if (pm.value.object.get("is_dm")) |v| {
             if (v == .bool) parsed.fields.is_dm = v.bool;
         }
@@ -557,6 +561,44 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         }
     }
     return parsed;
+}
+
+fn buildInboundConversationContext(
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?ConversationContext {
+    const inferred_is_group = if (meta.is_group) |value|
+        value
+    else if (meta.is_dm) |value|
+        !value
+    else if (meta.peer_kind) |kind|
+        kind != .direct
+    else if (meta.guild_id != null)
+        true
+    else
+        null;
+
+    const group_id = if (meta.guild_id) |guild_id|
+        guild_id
+    else if (meta.peer_kind != null and meta.peer_id != null and meta.peer_kind.? != .direct)
+        meta.peer_id.?
+    else if (inferred_is_group != null and inferred_is_group.? == true)
+        meta.channel_id orelse msg.chat_id
+    else
+        null;
+
+    const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
+
+    return buildConversationContext(.{
+        .channel = if (msg.channel.len > 0) msg.channel else null,
+        .account_id = meta.account_id,
+        .sender_id = if (msg.sender_id.len > 0) msg.sender_id else null,
+        .sender_username = meta.sender_username,
+        .sender_display_name = meta.sender_display_name,
+        .peer_id = meta.peer_id orelse if (has_scope) msg.chat_id else null,
+        .group_id = group_id,
+        .is_group = inferred_is_group,
+    });
 }
 
 fn resolveInboundRouteSessionKeyWithMetadata(
@@ -656,16 +698,29 @@ fn resolveTypingRecipient(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
+    if (meta.typing_recipient) |recipient| {
+        if (recipient.len == 0) return null;
+        return allocator.dupe(u8, recipient) catch null;
+    }
+
     if (std.mem.eql(u8, channel_name, "slack")) {
         const slack_target = resolveSlackStatusTarget(meta, chat_id) orelse return null;
         return std.fmt.allocPrint(allocator, "{s}:{s}", .{ slack_target.channel_id, slack_target.thread_ts }) catch null;
     }
 
-    if (!std.mem.eql(u8, channel_name, "discord") and !std.mem.eql(u8, channel_name, "mattermost") and !std.mem.eql(u8, channel_name, "teams")) {
-        return null;
-    }
     if (chat_id.len == 0) return null;
     return allocator.dupe(u8, chat_id) catch null;
+}
+
+fn resolveOutboundChannel(
+    registry: *const dispatch.ChannelRegistry,
+    channel_name: []const u8,
+    account_id: ?[]const u8,
+) ?channels_mod.Channel {
+    return if (account_id) |aid|
+        registry.findByNameAccount(channel_name, aid)
+    else
+        registry.findByName(channel_name);
 }
 
 fn sendInboundProcessingIndicator(
@@ -676,11 +731,7 @@ fn sendInboundProcessingIndicator(
     chat_id: []const u8,
     meta: channel_adapters.InboundMetadata,
 ) ?[]u8 {
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return null;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return null;
 
     const recipient = resolveTypingRecipient(allocator, channel_name, chat_id, meta) orelse return null;
     ch.startTyping(recipient) catch {
@@ -699,11 +750,7 @@ fn clearInboundProcessingIndicator(
 ) void {
     const target = recipient orelse return;
     defer allocator.free(target);
-    const channel_opt = if (account_id) |aid|
-        registry.findByNameAccount(channel_name, aid)
-    else
-        registry.findByName(channel_name);
-    const ch = channel_opt orelse return;
+    const ch = resolveOutboundChannel(registry, channel_name, account_id) orelse return;
     ch.stopTyping(target) catch {};
 }
 
@@ -734,12 +781,6 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
     };
-}
-
-fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or
-        std.mem.eql(u8, channel, "telegram") or
-        std.mem.eql(u8, channel, "dingtalk");
 }
 
 fn makeAssistantReplyOutbound(
@@ -773,11 +814,11 @@ fn makeAssistantReplyOutbound(
 }
 
 fn makeStreamingSinkForChannel(
-    channel: []const u8,
+    streaming_supported: bool,
     raw_sink: streaming.Sink,
     filter: *streaming.TagFilter,
 ) ?streaming.Sink {
-    if (!supportsStreamingOutbound(channel)) return null;
+    if (!streaming_supported) return null;
     filter.* = streaming.TagFilter.init(raw_sink);
     return filter.sink();
 }
@@ -823,7 +864,11 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const use_streaming_outbound = supportsStreamingOutbound(msg.channel);
+        const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+        const use_streaming_outbound = if (outbound_channel) |channel|
+            channel.supportsStreamingOutbound()
+        else
+            false;
         var streaming_ctx = StreamingOutboundCtx{
             .allocator = allocator,
             .event_bus = event_bus,
@@ -838,7 +883,7 @@ fn inboundDispatcherThread(
                 .callback = publishStreamingChunk,
                 .ctx = @ptrCast(&streaming_ctx),
             };
-            stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
+            stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
         }
 
         if (std.mem.eql(u8, msg.channel, "max")) {
@@ -846,19 +891,7 @@ fn inboundDispatcherThread(
             defer channels_mod.max.setInteractiveOwnerContext(null);
         }
 
-        // Build conversation context for channels that provide sender metadata.
-        // Discord passes sender info via metadata JSON; Signal/Telegram do it in channel_loop.
-        const conversation_context: ?ConversationContext = if (std.mem.eql(u8, msg.channel, "discord"))
-            .{
-                .channel = "discord",
-                .sender_id = msg.sender_id,
-                .sender_username = parsed_meta.fields.sender_username,
-                .sender_display_name = parsed_meta.fields.sender_display_name,
-                .group_id = parsed_meta.fields.guild_id,
-                .is_group = if (parsed_meta.fields.is_dm) |dm| !dm else null,
-            }
-        else
-            null;
+        const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
 
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
@@ -1176,7 +1209,7 @@ test "computeBackoff saturating" {
     try std.testing.expectEqual(std.math.maxInt(u64), computeBackoff(std.math.maxInt(u64), std.math.maxInt(u64)));
 }
 
-test "makeStreamingSinkForChannel filters web chunks" {
+test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
     const Collector = struct {
         buf: [128]u8 = undefined,
         len: usize = 0,
@@ -1204,7 +1237,7 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     var collector = Collector{};
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("web", collector.sink(), &filter).?;
+    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
     sink.emitFinal();
 
@@ -1212,26 +1245,26 @@ test "makeStreamingSinkForChannel filters web chunks" {
     try std.testing.expect(collector.got_final);
 }
 
-test "makeStreamingSinkForChannel supports dingtalk" {
+test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("dingtalk", .{
+    const sink = makeStreamingSinkForChannel(true, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink != null);
 }
 
-test "makeStreamingSinkForChannel returns null for unsupported channel" {
+test "makeStreamingSinkForChannel returns null when streaming is disabled" {
     const Noop = struct {
         fn callback(_: *anyopaque, _: streaming.Event) void {}
     };
 
     var filter: streaming.TagFilter = undefined;
-    const sink = makeStreamingSinkForChannel("discord", .{
+    const sink = makeStreamingSinkForChannel(false, .{
         .callback = Noop.callback,
         .ctx = undefined,
     }, &filter);
@@ -1442,6 +1475,38 @@ test "resolveInboundRouteSessionKey matches non-primary maixcam account by chann
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
     try std.testing.expectEqualStrings("agent:lab-camera-agent:vision-lab:direct:device-2", routed.?);
+}
+
+test "resolveInboundRouteSessionKey routes nostr direct messages by sender" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "nostr-dm-agent",
+            .match = .{
+                .channel = "nostr",
+                .account_id = "default",
+                .peer = .{ .kind = .direct, .id = "pubkey-42" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "nostr",
+        .sender_id = "pubkey-42",
+        .chat_id = "pubkey-42",
+        .content = "ping",
+        .session_key = "nostr:pubkey-42",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:nostr-dm-agent:nostr:direct:pubkey-42", routed.?);
 }
 
 test "resolveInboundRouteSessionKey routes discord channel messages by chat_id" {
@@ -2006,6 +2071,69 @@ test "parseInboundMetadata extracts discord sender identity fields" {
 
     try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
     try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
+}
+
+test "buildInboundConversationContext preserves discord identity metadata" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "discord",
+        .sender_id = "user-42",
+        .chat_id = "778899",
+        .content = "hello",
+        .session_key = "discord:778899",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .account_id = "discord-main",
+        .guild_id = "guild-1",
+        .is_dm = false,
+        .sender_username = "discord-user",
+        .sender_display_name = "Discord User",
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("discord", context.channel.?);
+    try std.testing.expectEqualStrings("discord-main", context.account_id.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("778899", context.peer_id.?);
+    try std.testing.expectEqualStrings("discord-user", context.sender_username.?);
+    try std.testing.expectEqualStrings("Discord User", context.sender_display_name.?);
+    try std.testing.expectEqualStrings("guild-1", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
+}
+
+test "buildInboundConversationContext keeps channel and sender when metadata is absent" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-1",
+        .chat_id = "chat-1",
+        .content = "hello",
+        .session_key = "external:chat-1",
+    };
+    const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expectEqualStrings("user-1", context.sender_id.?);
+    try std.testing.expect(context.group_id == null);
+    try std.testing.expect(context.is_group == null);
+}
+
+test "buildInboundConversationContext uses standardized peer metadata for external channels" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-42",
+        .chat_id = "120363-room",
+        .content = "hello",
+        .session_key = "external:room",
+    };
+    const context = buildInboundConversationContext(&msg, .{
+        .peer_kind = .group,
+        .peer_id = "120363-room",
+        .is_group = true,
+    }) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.peer_id.?);
+    try std.testing.expectEqualStrings("120363-room", context.group_id.?);
+    try std.testing.expect(context.is_group.?);
 }
 
 test "makeAssistantReplyOutbound preserves plain replies without choices" {
